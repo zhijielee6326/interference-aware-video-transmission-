@@ -1175,6 +1175,12 @@ class VideoTransmissionSystem:
                         # 干扰监测
                         self._monitor_interference(signal_data)
 
+                        # 实时仪表盘模式只依赖PSD、IQ和CCNN概率状态。
+                        # 跳过视频解调/解码可显著降低USRP连续接收时的处理阻塞。
+                        if self.no_gui:
+                            self.controller.stats['frames_received'] += 1
+                            continue
+
                         # RX处理链
                         rx_frame, status = self._rx_pipeline(signal_data)
                         params = self.controller.get_smoothed_params()
