@@ -17,10 +17,11 @@ N      = 5000     # 采样点数
 T      = N / FS   # 采样时长 = 2.5ms
 
 CENTER_FREQ = 2.45e9
-TX_GAIN     = 20
+TX_GAIN     = 10
 RX_GAIN     = 40
 BUFFER_SIZE = 4096
-CCNN_PY     = "/home/zhijielee/毕设/CCNN/3_scripts/training/CCNN.py"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+CCNN_PY     = os.path.join(PROJECT_ROOT, "CCNN", "3_scripts", "training", "CCNN.py")
 
 
 # ==================== MATLAB精确翻译 ====================
@@ -291,6 +292,9 @@ def make_combined(jammer_type, jsr_db=10,
     randd   = np.random.randint(1, 101)
     carrier = gen_psk(modulation, rs, 0, fs, t_dur)
 
+    if jammer_type == 'clean':
+        return carrier.astype(np.complex64)
+
     gen_fn  = GEN_MAP[jammer_type]
     # MTJ没有randd参数
     if jammer_type == 'mtj':
@@ -304,17 +308,19 @@ def make_combined(jammer_type, jsr_db=10,
 # ==================== USRP收发器 ====================
 
 class USRPTransceiver:
-    def __init__(self, serial):
+    def __init__(self, serial, tx_gain=TX_GAIN, rx_gain=RX_GAIN):
+        self.tx_gain = tx_gain
+        self.rx_gain = rx_gain
         self.usrp = uhd.usrp.MultiUSRP(serial)
         self.usrp.set_tx_rate(FS, 0)
         self.usrp.set_tx_freq(uhd.libpyuhd.types.tune_request(CENTER_FREQ), 0)
-        self.usrp.set_tx_gain(TX_GAIN, 0)
+        self.usrp.set_tx_gain(tx_gain, 0)
         self.usrp.set_tx_antenna("TX/RX", 0)
         self.tx_stream = self.usrp.get_tx_stream(uhd.usrp.StreamArgs("fc32", "sc16"))
 
         self.usrp.set_rx_rate(FS, 0)
         self.usrp.set_rx_freq(uhd.libpyuhd.types.tune_request(CENTER_FREQ), 0)
-        self.usrp.set_rx_gain(RX_GAIN, 0)
+        self.usrp.set_rx_gain(rx_gain, 0)
         self.usrp.set_rx_antenna("RX2", 0)
         sa      = uhd.usrp.StreamArgs("fc32", "sc16")
         sa.args = "recv_frame_size=4096,num_recv_frames=512"
@@ -324,7 +330,7 @@ class USRPTransceiver:
         self.tx_queue   = queue.Queue(maxsize=50)
         self.is_running = False
         print(f"✓ USRP @ {CENTER_FREQ/1e9:.2f}GHz  "
-              f"FS={FS/1e6:.0f}MHz  TX={TX_GAIN}dB  RX={RX_GAIN}dB")
+              f"FS={FS/1e6:.0f}MHz  TX={tx_gain}dB  RX={rx_gain}dB")
 
     def _tx_worker(self):
         while self.is_running:
@@ -377,6 +383,13 @@ class USRPTransceiver:
         except queue.Full:
             pass
 
+    def clear_rx_queue(self):
+        while True:
+            try:
+                self.rx_queue.get_nowait()
+            except queue.Empty:
+                break
+
     def recv_n(self, n_samples, timeout=2.0):
         buf   = []
         t_end = time.time() + timeout
@@ -391,23 +404,50 @@ class USRPTransceiver:
         return None
 
 
+def select_strongest_window(samples, n=N):
+    """从接收长块中选择平均功率最高的N点窗口，降低短突发无同步带来的截窗误差。"""
+    if samples is None or len(samples) < n:
+        return None
+    if len(samples) == n:
+        return samples
+    step = max(1, n // 4)
+    best_start = 0
+    best_power = -1.0
+    for start in range(0, len(samples) - n + 1, step):
+        window = samples[start:start + n]
+        power = float(np.mean(np.abs(window) ** 2))
+        if power > best_power:
+            best_start = start
+            best_power = power
+    return samples[best_start:best_start + n]
+
+
 # ==================== 主程序 ====================
 
 def main():
     parser = argparse.ArgumentParser(description="USRP模型验证（精确复现MATLAB信号）")
     parser.add_argument('--serial',  default="serial=7MFTKFU")
     parser.add_argument('--model',
-        default="/home/zhijielee/毕设/CCNN/2_models/best/ccnn_epoch_86_acc_0.9913.pth")
+        default=os.path.join(PROJECT_ROOT, "CCNN", "2_models", "wide_jsr",
+                             "ccnn_epoch_26_acc_0.9991.pth"))
     parser.add_argument('--classes', type=int,   default=6)
     parser.add_argument('--tests',   type=int,   default=10)
     parser.add_argument('--jsr',     type=float, default=10,
         help='干信比dB（训练集用6或10）')
+    parser.add_argument('--tx-gain', type=float, default=TX_GAIN,
+        help='USRP发射增益dB，天线测试建议10')
+    parser.add_argument('--rx-gain', type=float, default=RX_GAIN,
+        help='USRP接收增益dB')
+    parser.add_argument('--repeat', type=int, default=40,
+        help='每个测试样本重复发送次数，用于提高无同步短突发测试稳定性')
+    parser.add_argument('--rx-windows', type=int, default=8,
+        help='每次测试接收的5000点窗口数量')
     parser.add_argument('--type',    default='all',
         choices=list(TYPE_LABEL.keys()) + ['all'])
     args = parser.parse_args()
 
     detector   = InterferenceDetector(args.model, CCNN_PY, args.classes)
-    trx        = USRPTransceiver(args.serial)
+    trx        = USRPTransceiver(args.serial, args.tx_gain, args.rx_gain)
     test_types = list(TYPE_LABEL.keys()) if args.type == 'all' else [args.type]
     results    = {t: {'correct': 0, 'total': 0} for t in test_types}
 
@@ -415,31 +455,35 @@ def main():
     print(f"USRP实机验证  RS={RS/1e3:.0f}kHz  JSR={args.jsr}dB")
     print(f"{'='*65}")
 
-    trx.start()
-    time.sleep(1)
+    try:
+        trx.start()
+        time.sleep(1)
 
-    for ttype in test_types:
-        expected = TYPE_LABEL[ttype]
-        print(f"\n测试 [{ttype.upper()}] → 期望: {expected}")
+        for ttype in test_types:
+            expected = TYPE_LABEL[ttype]
+            print(f"\n测试 [{ttype.upper()}] → 期望: {expected}")
 
-        for i in range(args.tests):
-            sig = make_combined(ttype, jsr_db=args.jsr)
-            trx.send(sig)
-            time.sleep(0.15)
+            for i in range(args.tests):
+                sig = make_combined(ttype, jsr_db=args.jsr)
+                tx_sig = np.tile(sig, max(1, args.repeat))
+                trx.clear_rx_queue()
+                trx.send(tx_sig)
+                time.sleep(0.15)
 
-            rx = trx.recv_n(N, timeout=1.5)
-            if rx is not None:
-                det, conf = detector.detect(rx)
-                ok        = (det == expected)
-                results[ttype]['total']   += 1
-                results[ttype]['correct'] += ok
-                print(f"  [{i+1:2d}/{args.tests}] {'✓' if ok else '✗'} "
-                      f"检测: {det} ({conf:.2f})")
-            else:
-                print(f"  [{i+1:2d}/{args.tests}] ⚠️  数据不足")
-            time.sleep(0.2)
-
-    trx.stop()
+                rx_block = trx.recv_n(N * max(1, args.rx_windows), timeout=1.5)
+                rx = select_strongest_window(rx_block, N)
+                if rx is not None:
+                    det, conf = detector.detect(rx)
+                    ok        = (det == expected)
+                    results[ttype]['total']   += 1
+                    results[ttype]['correct'] += ok
+                    print(f"  [{i+1:2d}/{args.tests}] {'✓' if ok else '✗'} "
+                          f"检测: {det} ({conf:.2f})")
+                else:
+                    print(f"  [{i+1:2d}/{args.tests}] ⚠️  数据不足")
+                time.sleep(0.2)
+    finally:
+        trx.stop()
 
     print(f"\n{'='*65}")
     total_c = total_t = 0
