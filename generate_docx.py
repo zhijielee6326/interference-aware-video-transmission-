@@ -18,6 +18,10 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+import subprocess
+import tempfile
+import zipfile
+
 from docx import Document
 from docx.enum.section import WD_SECTION
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
@@ -25,6 +29,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt
+from lxml import etree
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -258,17 +263,120 @@ def add_paragraph(document: Document, text: str, stats: ConvertStats) -> None:
     stats.paragraphs += 1
 
 
+OMML_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+OMML_NS_PREFIX = f"{{{OMML_NS}}}"
+
+
+def build_formula_map(lines: list[str]) -> dict[int, etree._Element]:
+    """Pre-convert all $$...$$ formulas to OMML using pandoc.
+
+    Returns a dict mapping line-number → OMML element.
+    """
+    formula_lines: list[tuple[int, str]] = []
+    in_formula = False
+    formula_buf: list[str] = []
+    formula_start = -1
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "$$":
+            if in_formula:
+                latex = "\n".join(formula_buf).strip()
+                if latex:
+                    formula_lines.append((formula_start, latex))
+                in_formula = False
+                formula_buf = []
+            else:
+                in_formula = True
+                formula_buf = []
+                formula_start = idx
+            continue
+        if in_formula:
+            formula_buf.append(line)
+            continue
+        # Single-line $$...$$
+        if stripped.startswith("$$") and stripped.endswith("$$") and len(stripped) > 4:
+            latex = stripped[2:-2].strip()
+            if latex:
+                formula_lines.append((idx, latex))
+
+    if not formula_lines:
+        return {}
+
+    # Build one pandoc input with anchors for each formula
+    pandoc_parts = []
+    for i, (_, latex) in enumerate(formula_lines):
+        pandoc_parts.append(f"$FORMULA_START_{i}$")
+        pandoc_parts.append(f"$$\n{latex}\n$$")
+        pandoc_parts.append(f"$FORMULA_END_{i}$")
+    pandoc_input = "\n".join(pandoc_parts)
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.md"
+            output_path = Path(tmpdir) / "output.docx"
+            input_path.write_text(pandoc_input, encoding="utf-8")
+            result = subprocess.run(
+                ["pandoc", str(input_path), "-o", str(output_path), "--to", "docx"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                print(f"  [公式] pandoc 转换失败: {result.stderr[:200]}")
+                return {}
+
+            with zipfile.ZipFile(output_path) as zf:
+                doc_bytes = zf.read("word/document.xml")
+
+        tree = etree.fromstring(doc_bytes)
+        # Collect all oMathPara and oMath elements
+        omml_elements = tree.findall(f".//{OMML_NS_PREFIX}oMathPara")
+        if not omml_elements:
+            omml_elements = tree.findall(f".//{OMML_NS_PREFIX}oMath")
+
+        if len(omml_elements) != len(formula_lines):
+            print(f"  [公式] OMML数量({len(omml_elements)}) ≠ 公式数量({len(formula_lines)})，跳过公式渲染")
+            return {}
+
+        result_map: dict[int, etree._Element] = {}
+        for (line_idx, _), omml in zip(formula_lines, omml_elements):
+            result_map[line_idx] = omml
+        print(f"  [公式] 成功转换 {len(result_map)} 个公式为 Word 原生格式")
+        return result_map
+
+    except Exception as e:
+        print(f"  [公式] 转换异常，将使用纯文本: {e}")
+        return {}
+
+
+def add_formula_paragraph(document: Document, omml_element: etree._Element | None,
+                          fallback_text: str) -> None:
+    """Add a formula paragraph: OMML if available, else plain text."""
+    p = document.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    set_paragraph_format(p, WD_ALIGN_PARAGRAPH.CENTER, first_line=False)
+    if omml_element is not None:
+        p._element.append(omml_element)
+    else:
+        run = p.add_run(fallback_text)
+        set_run_font(run, size=12)
+
+
 def convert_markdown(input_path: Path, output_path: Path, backup=True) -> ConvertStats:
     stats = ConvertStats()
     lines = input_path.read_text(encoding="utf-8").splitlines()
     document = Document()
     configure_document(document)
 
+    # Pre-convert all formulas to OMML using pandoc
+    print("正在转换公式...")
+    formula_map = build_formula_map(lines)
+
     i = 0
     in_code = False
     code_lines: list[str] = []
     in_formula = False
     formula_lines: list[str] = []
+    formula_start_line = -1
 
     while i < len(lines):
         line = lines[i]
@@ -293,28 +401,22 @@ def convert_markdown(input_path: Path, output_path: Path, backup=True) -> Conver
             continue
 
         if stripped.startswith("$$") and stripped.endswith("$$") and len(stripped) > 4:
-            p = document.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            set_paragraph_format(p, WD_ALIGN_PARAGRAPH.CENTER, first_line=False)
-            run = p.add_run(stripped)
-            set_run_font(run, size=12)
+            add_formula_paragraph(document, formula_map.get(i), stripped)
             stats.formulas += 1
             i += 1
             continue
 
         if stripped == "$$":
             if in_formula:
-                p = document.add_paragraph()
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                set_paragraph_format(p, WD_ALIGN_PARAGRAPH.CENTER, first_line=False)
-                run = p.add_run("$$" + "\n".join(formula_lines) + "$$")
-                set_run_font(run, size=12)
+                fallback = "$$" + "\n".join(formula_lines) + "$$"
+                add_formula_paragraph(document, formula_map.get(formula_start_line), fallback)
                 stats.formulas += 1
                 in_formula = False
                 formula_lines = []
             else:
                 in_formula = True
                 formula_lines = []
+                formula_start_line = i
             i += 1
             continue
         if in_formula:
