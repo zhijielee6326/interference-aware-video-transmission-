@@ -7,12 +7,23 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Large training datasets - keep only samples/
-CCNN/1_datasets/train/
-CCNN/1_datasets/train_wide_jsr/
-CCNN/1_datasets/test/
-CCNN/1_datasets/raw/
-CCNN/matlab_data_generate/data/
+# Large training datasets
+01_数据生成/datasets/train/
+01_数据生成/datasets/train_wide_jsr/
+01_数据生成/datasets/test/
+01_数据生成/datasets/raw/
+01_数据生成/MATLAB信号生成/data/
+
+# Large model checkpoints (keep best only)
+02_模型训练/models/wide_jsr/
+
+# USRP drivers (large binaries)
+archive/B210mini/
+archive/用户使用教程/
+archive/驱动与教程/
+
+# Archive (local only)
+archive/
 
 # IDE
 .vscode/
@@ -22,5 +33,11 @@ CCNN/matlab_data_generate/data/
 .DS_Store
 Thumbs.db
 
-# Claude local settings
+# Claude / AI tool local settings
 .claude/
+.accelerate/
+
+# Backup files
+*_备份_*.docx
+*_自动备份_*.docx
+*_生成前备份_*.docx
